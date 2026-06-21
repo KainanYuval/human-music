@@ -1,0 +1,22 @@
+[package]
+name = "verification_engine"
+version.workspace = true
+edition.workspace = true
+description = "DAW project ↔ released audio provenance verifier"
+
+[[bin]]
+name = "gb-verify"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+garageband = { path = "../daw_interfaces/garageband" }
+hound = "3"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+toml = "0.8"

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>gb-verify</title>
+    <script src="./main.js" defer></script>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>gb-verify</h1>
+        <p class="subtitle">
+          Check whether released audio is explained by a GarageBand project.
+        </p>
+      </header>
+
+      <section class="panel">
+        <label>GarageBand project (.band)</label>
+        <div class="row">
+          <input id="project-path" type="text" readonly placeholder="No project selected" />
+          <button id="pick-project" type="button">Browse…</button>
+        </div>
+
+        <label>Released audio (WAV / MP3)</label>
+        <div class="row">
+          <input id="audio-path" type="text" readonly placeholder="No audio selected" />
+          <button id="pick-audio" type="button">Browse…</button>
+        </div>
+
+        <button id="run-verify" type="button" class="primary" disabled>
+          Run verification
+        </button>
+      </section>
+
+      <section class="panel progress-panel hidden" id="progress-panel">
+        <div class="progress-head">
+          <span id="stage-label">Starting…</span>
+          <span id="progress-percent">0%</span>
+        </div>
+        <progress id="progress-bar" max="100" value="0"></progress>
+
+        <div class="sub-progress hidden" id="sub-progress">
+          <div class="progress-head sub">
+            <span id="step-label">—</span>
+            <span id="step-percent">0%</span>
+          </div>
+          <progress id="step-bar" max="100" value="0" class="sub-bar"></progress>
+        </div>
+      </section>
+
+      <section class="panel result-panel hidden" id="result-panel">
+        <div id="verdict-badge" class="badge">—</div>
+        <p id="claim-text" class="claim"></p>
+        <dl class="stats">
+          <div>
+            <dt>Timeline coverage</dt>
+            <dd id="coverage-stat">—</dd>
+          </div>
+          <div>
+            <dt>Strong matches</dt>
+            <dd id="strong-stat">—</dd>
+          </div>
+          <div>
+            <dt>Possible matches</dt>
+            <dd id="possible-stat">—</dd>
+          </div>
+        </dl>
+        <p id="best-match" class="best-match"></p>
+        <div class="row actions">
+          <button id="open-report" type="button">Open HTML report</button>
+          <button id="open-folder" type="button">Open report folder</button>
+        </div>
+        <p id="error-text" class="error hidden"></p>
+      </section>
+    </main>
+  </body>
+</html>

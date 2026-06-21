@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "src/daw_interfaces/garageband",
+    "src/verification_engine",
+    "src/app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

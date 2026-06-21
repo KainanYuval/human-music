@@ -1,0 +1,23 @@
+# gb-verify matching & discrimination parameters
+# Override with: gb-verify --config path/to.toml ...
+
+[match_config]
+strong_min = 0.85
+possible_min = 0.70
+
+[coverage]
+window_seconds = 2.0
+hop_seconds = 0.5
+window_score_min = 0.82
+
+[discrimination]
+enabled = true
+competitive_margin = 0.008
+pass_win_rate = 0.45
+pass_exclusive_advantage = 0.008
+require_beat_all_competitors = true
+rival_advantage_margin = 0.005
+
+[verdict]
+pass_coverage_min = 0.70
+require_strong_match = true
