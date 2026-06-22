@@ -74,15 +74,11 @@ jobs:
           echo "cli=${cli}" >> "${GITHUB_OUTPUT}"
           ls -lh "${dmg}" "${cli}"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Setup ORAS
         uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Publish macOS bundle to GHCR
         shell: bash
