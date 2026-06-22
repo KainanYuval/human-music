@@ -1,0 +1,20 @@
+[package]
+name = "shazam_engine"
+version.workspace = true
+edition.workspace = true
+description = "Shazam-style landmark fingerprint matcher"
+
+[[bin]]
+name = "shazam-bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "shazam-cross-check"
+path = "src/bin/cross_check.rs"
+
+[dependencies]
+anyhow = "1"
+hound = "3"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

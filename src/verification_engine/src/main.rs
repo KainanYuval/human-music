@@ -24,11 +24,7 @@ struct Cli {
     #[arg(long)]
     progress_jsonl: bool,
 
-    /// Directory tree to scan for rival `.band` projects (required for discrimination)
-    #[arg(long)]
-    catalog_dir: Option<PathBuf>,
-
-    /// TOML config for matching / coverage / discrimination thresholds
+    /// TOML config for matching / coverage thresholds
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -56,34 +52,26 @@ fn main() -> Result<()> {
     let config = load_config(cli.config.as_ref()).context("load config")?;
     let options = VerifyOptions {
         config,
-        catalog_dir: cli.catalog_dir,
     };
 
     let payload = if cli.progress_jsonl {
-        let mut progress_cb = |evt: ProgressEvent| {
-            let _ = write_jsonl_progress(&evt);
-        };
         run_verify_with_options(
             &cli.project,
             &cli.audio,
             &cli.out,
             options,
-            Some(&mut progress_cb),
+            Some(|evt: ProgressEvent| {
+                let _ = write_jsonl_progress(&evt);
+            }),
         )?
     } else {
-        run_verify_with_options(&cli.project, &cli.audio, &cli.out, options, None)?
+        run_verify_with_options(&cli.project, &cli.audio, &cli.out, options, None::<fn(ProgressEvent)>)?
     };
 
     let verdict = payload["verdict"].as_str().unwrap_or("FAIL");
     let score = payload["provenance_score"].as_f64().unwrap_or(0.0) * 100.0;
     println!("Verdict: {verdict}");
-    println!("Production Provenance: {score:.1}%");
-    if let Some(win) = payload["timeline_coverage"]["competitive_win_rate"].as_f64() {
-        println!("Competitive win rate: {:.1}%", win * 100.0);
-    }
-    if let Some(adv) = payload["timeline_coverage"]["exclusive_advantage"].as_f64() {
-        println!("Exclusive advantage: {:.4}", adv);
-    }
+    println!("Song explained: {score:.1}%");
     if let Some(best) = payload["summary"]["best_match"].as_object() {
         println!(
             "Best match: {} @ {:.2}s (score {:.4})",

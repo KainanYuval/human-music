@@ -4,74 +4,113 @@
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>gb-verify</title>
+    <title>Human Music</title>
     <script src="./main.js" defer></script>
   </head>
   <body>
-    <main class="container">
-      <header>
-        <h1>gb-verify</h1>
-        <p class="subtitle">
-          Check whether released audio is explained by a GarageBand project.
-        </p>
+    <div class="scene-backdrop" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="masthead">
+        <h1>Human Music</h1>
+        <p class="masthead-lead">Prove you made it.</p>
+        <p class="masthead-sub">Drop your GarageBand project and final track. See if the bounce really came from your stems — then save a report you can share.</p>
       </header>
 
-      <section class="panel">
-        <label>GarageBand project (.band)</label>
-        <div class="row">
-          <input id="project-path" type="text" readonly placeholder="No project selected" />
-          <button id="pick-project" type="button">Browse…</button>
+      <section class="block form-block">
+        <div class="field">
+          <label for="project-path">Session file</label>
+          <div class="field-row">
+            <input
+              id="project-path"
+              type="text"
+              readonly
+              placeholder="Your .band folder"
+            />
+            <button id="pick-project" type="button" class="ghost">Choose</button>
+          </div>
         </div>
 
-        <label>Released audio (WAV / MP3)</label>
-        <div class="row">
-          <input id="audio-path" type="text" readonly placeholder="No audio selected" />
-          <button id="pick-audio" type="button">Browse…</button>
+        <div class="field">
+          <label for="audio-path">Final track</label>
+          <div class="field-row">
+            <input
+              id="audio-path"
+              type="text"
+              readonly
+              placeholder="The WAV or MP3 you released"
+            />
+            <button id="pick-audio" type="button" class="ghost">Choose</button>
+          </div>
         </div>
 
-        <button id="run-verify" type="button" class="primary" disabled>
-          Run verification
-        </button>
+        <button id="run-verify" type="button" class="run" disabled>Prove it</button>
       </section>
 
-      <section class="panel progress-panel hidden" id="progress-panel">
-        <div class="progress-head">
-          <span id="stage-label">Starting…</span>
+      <section class="block progress-block hidden" id="progress-panel">
+        <div class="progress-meta">
+          <span id="stage-label">Starting</span>
           <span id="progress-percent">0%</span>
         </div>
-        <progress id="progress-bar" max="100" value="0"></progress>
-
-        <div class="sub-progress hidden" id="sub-progress">
-          <div class="progress-head sub">
-            <span id="step-label">—</span>
-            <span id="step-percent">0%</span>
-          </div>
-          <progress id="step-bar" max="100" value="0" class="sub-bar"></progress>
+        <div class="progress-track" aria-hidden="true">
+          <div class="progress-fill" id="progress-fill"></div>
         </div>
+        <p class="progress-plan hidden" id="progress-plan"></p>
+        <p class="progress-detail" id="progress-detail"></p>
       </section>
 
-      <section class="panel result-panel hidden" id="result-panel">
-        <div id="verdict-badge" class="badge">—</div>
-        <p id="claim-text" class="claim"></p>
-        <dl class="stats">
+      <section class="block result-block hidden" id="result-panel">
+        <p id="verdict-badge" class="verdict">—</p>
+        <p id="claim-text" class="summary"></p>
+
+        <dl class="measures">
           <div>
-            <dt>Timeline coverage</dt>
+            <dt>From session</dt>
             <dd id="coverage-stat">—</dd>
+            <dd class="measure-note" id="coverage-detail"></dd>
           </div>
           <div>
-            <dt>Strong matches</dt>
+            <dt>Clear</dt>
             <dd id="strong-stat">—</dd>
           </div>
           <div>
-            <dt>Possible matches</dt>
+            <dt>Likely</dt>
             <dd id="possible-stat">—</dd>
           </div>
         </dl>
-        <p id="best-match" class="best-match"></p>
-        <div class="row actions">
-          <button id="open-report" type="button">Open HTML report</button>
-          <button id="open-folder" type="button">Open report folder</button>
+
+        <p id="best-match" class="note"></p>
+
+        <div class="result-actions">
+          <button id="open-report" type="button" class="ghost">Open report</button>
+          <button id="open-folder" type="button" class="ghost">Report folder</button>
         </div>
+
+        <section class="publish-block hidden" id="publish-panel">
+          <h2 class="publish-title">Publish receipt</h2>
+          <p class="publish-lead">Get a public page and QR for your bio or Bandcamp.</p>
+          <div class="field">
+            <label for="artist-name">Artist name</label>
+            <input id="artist-name" type="text" placeholder="Your artist name" />
+          </div>
+          <div class="field">
+            <label for="song-title">Song title</label>
+            <input id="song-title" type="text" placeholder="Track title" />
+          </div>
+          <button id="publish-btn" type="button" class="run publish-run" disabled>
+            Publish
+          </button>
+          <p id="publish-status" class="publish-status hidden"></p>
+          <div class="publish-result hidden" id="publish-result">
+            <p class="publish-url-label">Your verification page</p>
+            <p id="publish-url" class="publish-url"></p>
+            <div class="result-actions">
+              <button id="open-page" type="button" class="ghost">Open page</button>
+              <button id="open-qr" type="button" class="ghost">Open QR</button>
+              <button id="copy-url" type="button" class="ghost">Copy link</button>
+            </div>
+          </div>
+        </section>
+
         <p id="error-text" class="error hidden"></p>
       </section>
     </main>

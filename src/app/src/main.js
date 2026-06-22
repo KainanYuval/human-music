@@ -1,6 +1,6 @@
 function tauri() {
   if (!window.__TAURI__) {
-    throw new Error("Tauri API not available. Run with: cd app && npm run dev");
+    throw new Error("Tauri API not available. Run with: cd src/app && npm run dev");
   }
   return window.__TAURI__;
 }
@@ -9,27 +9,81 @@ const projectInput = document.querySelector("#project-path");
 const audioInput = document.querySelector("#audio-path");
 const runButton = document.querySelector("#run-verify");
 const progressPanel = document.querySelector("#progress-panel");
-const progressBar = document.querySelector("#progress-bar");
+const progressFill = document.querySelector("#progress-fill");
 const stageLabel = document.querySelector("#stage-label");
 const progressPercent = document.querySelector("#progress-percent");
-const subProgress = document.querySelector("#sub-progress");
-const stepBar = document.querySelector("#step-bar");
-const stepLabel = document.querySelector("#step-label");
-const stepPercent = document.querySelector("#step-percent");
+const progressPlan = document.querySelector("#progress-plan");
+const progressDetail = document.querySelector("#progress-detail");
 const resultPanel = document.querySelector("#result-panel");
 const verdictBadge = document.querySelector("#verdict-badge");
 const claimText = document.querySelector("#claim-text");
 const coverageStat = document.querySelector("#coverage-stat");
+const coverageDetail = document.querySelector("#coverage-detail");
 const strongStat = document.querySelector("#strong-stat");
 const possibleStat = document.querySelector("#possible-stat");
 const bestMatch = document.querySelector("#best-match");
 const errorText = document.querySelector("#error-text");
 const openReportBtn = document.querySelector("#open-report");
 const openFolderBtn = document.querySelector("#open-folder");
+const publishPanel = document.querySelector("#publish-panel");
+const artistInput = document.querySelector("#artist-name");
+const songInput = document.querySelector("#song-title");
+const publishBtn = document.querySelector("#publish-btn");
+const publishStatus = document.querySelector("#publish-status");
+const publishResult = document.querySelector("#publish-result");
+const publishUrl = document.querySelector("#publish-url");
+const openPageBtn = document.querySelector("#open-page");
+const openQrBtn = document.querySelector("#open-qr");
+const copyUrlBtn = document.querySelector("#copy-url");
 
 let lastResult = null;
+let lastPublish = null;
 let running = false;
+let publishing = false;
 let estimatedSeconds = null;
+let planSummaryLine = null;
+
+const STAGE_LABELS = {
+  "Scanning project": "Reading session",
+  "Normalizing audio": "Preparing final track",
+  "Analyzing fingerprints": "Scanning stems",
+  "Matching recordings": "Matching stems",
+  "Timeline coverage": "Checking final track",
+  "Collecting evidence": "Building receipt",
+  "Writing report": "Saving report",
+  Complete: "Done",
+  Working: "Working",
+};
+
+const VERDICT_LABELS = {
+  PASS: "Yours",
+  FAIL: "Doesn't match",
+};
+
+const CLAIM_LABELS = {
+  PASS: "Your session stems explain this track. Save the report — for your bio, Bandcamp, or anyone who asks.",
+  FAIL: "This bounce doesn't line up with stems in that project. Different mix, export, or wrong .band?",
+};
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m > 0) {
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+  return `${total}s`;
+}
+
+function humanStage(label) {
+  return STAGE_LABELS[label] || label;
+}
+
+function basename(path) {
+  if (!path) return "";
+  const parts = path.split(/[/\\]/);
+  return parts[parts.length - 1] || path;
+}
 
 function updateRunState() {
   runButton.disabled =
@@ -37,52 +91,58 @@ function updateRunState() {
 }
 
 function formatProgressLabel(percent) {
-  const pct = Math.round(Math.max(0, Math.min(1, percent)) * 100);
+  const pct = Math.max(0, Math.min(1, percent)) * 100;
   if (estimatedSeconds && percent > 0 && percent < 1) {
     const remaining = Math.max(0, estimatedSeconds * (1 - percent));
-    return `${pct}% · ~${Math.ceil(remaining)}s left`;
+    return `${pct.toFixed(1)}% · ~${Math.ceil(remaining)}s left`;
   }
-  return `${pct}%`;
+  return `${pct.toFixed(1)}%`;
 }
 
-function setBar(bar, pctEl, fraction) {
-  const pct = Math.round(Math.max(0, Math.min(1, fraction)) * 100);
-  bar.value = pct;
-  pctEl.textContent = `${pct}%`;
+function setBar(fraction) {
+  const clamped = Math.max(0, Math.min(1, fraction));
+  progressFill.style.width = `${clamped * 100}%`;
+  progressPercent.textContent = formatProgressLabel(clamped);
 }
 
 function resetProgress() {
   estimatedSeconds = null;
-  setBar(progressBar, progressPercent, 0);
-  stageLabel.textContent = "Starting…";
-  subProgress.classList.add("hidden");
-  setBar(stepBar, stepPercent, 0);
-  stepLabel.textContent = "—";
+  planSummaryLine = null;
+  setBar(0);
+  stageLabel.textContent = "Starting";
+  progressPlan.textContent = "";
+  progressPlan.classList.add("hidden");
+  progressDetail.textContent = "";
+}
+
+function formatPlanSummary(summary) {
+  if (!summary) return "";
+  return `${formatDuration(summary.song_seconds)} final track · ${summary.stem_count} stems in session · ~${Math.ceil(summary.estimated_seconds)}s`;
 }
 
 function handleProgress(evt) {
   if (evt.estimated_seconds != null) {
     estimatedSeconds = evt.estimated_seconds;
   }
+  if (evt.plan_summary) {
+    planSummaryLine = formatPlanSummary(evt.plan_summary);
+  }
 
   const overall = evt.percent ?? 0;
-  setBar(progressBar, progressPercent, overall);
-  progressPercent.textContent = formatProgressLabel(overall);
-  stageLabel.textContent = evt.stage_label || evt.message || "Working…";
+  setBar(overall);
+  stageLabel.textContent = humanStage(evt.stage_label || evt.message || "Working");
 
-  const hasStep =
-    evt.step_percent != null && evt.step && evt.step !== "done" && evt.step !== "complete";
-  if (hasStep) {
-    subProgress.classList.remove("hidden");
-    setBar(stepBar, stepPercent, evt.step_percent);
-    const itemPrefix =
-      evt.item_name && evt.item_total != null && evt.item_index != null
-        ? `[${evt.item_index + 1}/${evt.item_total}] ${evt.item_name} — `
-        : "";
-    stepLabel.textContent = `${itemPrefix}${evt.message}${evt.detail ? ` — ${evt.detail}` : ""}`;
-  } else if (evt.stage === "done") {
-    subProgress.classList.add("hidden");
+  if (planSummaryLine) {
+    progressPlan.textContent = planSummaryLine;
+    progressPlan.classList.remove("hidden");
   }
+
+  const itemName = basename(evt.item_name);
+  const itemPrefix =
+    itemName && evt.item_total != null && evt.item_index != null
+      ? `Stem ${evt.item_index + 1} of ${evt.item_total} · ${itemName}`
+      : "";
+  progressDetail.textContent = itemPrefix || evt.detail || "";
 }
 
 function showResultPanel() {
@@ -99,26 +159,74 @@ function showInlineError(message) {
   showResultPanel();
 }
 
+function updatePublishState() {
+  const canPublish =
+    !publishing &&
+    lastResult?.verdict === "PASS" &&
+    artistInput.value.trim() &&
+    songInput.value.trim();
+  publishBtn.disabled = !canPublish;
+}
+
+function hidePublishPanel() {
+  publishPanel.classList.add("hidden");
+  publishResult.classList.add("hidden");
+  publishStatus.classList.add("hidden");
+  publishStatus.textContent = "";
+  lastPublish = null;
+}
+
+function showPublishPanel() {
+  publishPanel.classList.remove("hidden");
+  publishResult.classList.add("hidden");
+  publishStatus.classList.add("hidden");
+  updatePublishState();
+}
+
+function renderPublishResult(result) {
+  lastPublish = result;
+  publishStatus.classList.add("hidden");
+  publishResult.classList.remove("hidden");
+  publishUrl.textContent = result.url;
+}
+
 function renderResult(result) {
   lastResult = result;
+  lastPublish = null;
   errorText.classList.add("hidden");
   errorText.textContent = "";
 
-  verdictBadge.textContent = result.verdict;
-  verdictBadge.className = `badge ${result.verdict.toLowerCase()}`;
+  verdictBadge.textContent =
+    VERDICT_LABELS[result.verdict] || result.verdict;
+  verdictBadge.className = `verdict ${result.verdict.toLowerCase()}`;
 
-  claimText.textContent = result.claim;
-  coverageStat.textContent = `${(result.coverage_ratio * 100).toFixed(1)}%`;
+  claimText.textContent =
+    CLAIM_LABELS[result.verdict] || result.claim;
+  const pct = (result.coverage_ratio * 100).toFixed(1);
+  coverageStat.textContent = `${pct}%`;
+  if (result.timeline_target_seconds > 0) {
+    coverageDetail.textContent = `${formatDuration(
+      result.timeline_explained_seconds,
+    )} of ${formatDuration(result.timeline_target_seconds)} of your track comes from session stems`;
+  } else {
+    coverageDetail.textContent = "How much of your track is explained by the project";
+  }
   strongStat.textContent = String(result.strong_match_count);
   possibleStat.textContent = String(result.possible_match_count);
 
   if (result.best_match) {
     const b = result.best_match;
-    bestMatch.textContent = `Best asset: ${b.asset} @ ${b.offset_seconds.toFixed(
-      2,
-    )}s (score ${b.match_score.toFixed(3)}, ${b.status})`;
+    bestMatch.textContent = `Strongest stem: ${basename(b.asset)} · ${formatDuration(
+      b.offset_seconds,
+    )}`;
   } else {
-    bestMatch.textContent = "No asset match found.";
+    bestMatch.textContent = "";
+  }
+
+  if (result.verdict === "PASS") {
+    showPublishPanel();
+  } else {
+    hidePublishPanel();
   }
 
   showResultPanel();
@@ -126,10 +234,13 @@ function renderResult(result) {
 
 function renderError(message) {
   lastResult = null;
-  verdictBadge.textContent = "ERROR";
-  verdictBadge.className = "badge error";
+  lastPublish = null;
+  hidePublishPanel();
+  verdictBadge.textContent = "Error";
+  verdictBadge.className = "verdict error";
   claimText.textContent = "";
   coverageStat.textContent = "—";
+  coverageDetail.textContent = "";
   strongStat.textContent = "—";
   possibleStat.textContent = "—";
   bestMatch.textContent = "";
@@ -146,13 +257,13 @@ async function pickProject() {
     const path = normalizeDialogPath(
       await tauri().dialog.open({
         multiple: false,
-        title: "Select GarageBand project (.band)",
-        filters: [{ name: "GarageBand Project", extensions: ["band"] }],
+        title: "Choose session file (.band)",
+        filters: [{ name: "GarageBand session", extensions: ["band"] }],
       }),
     );
     if (path) {
       if (!path.toLowerCase().endsWith(".band")) {
-        renderError("Please select a .band GarageBand project.");
+        renderError("Choose a GarageBand .band session folder.");
         return;
       }
       projectInput.value = path;
@@ -168,7 +279,7 @@ async function pickAudio() {
     const path = normalizeDialogPath(
       await tauri().dialog.open({
         multiple: false,
-        title: "Select released audio (WAV or MP3)",
+        title: "Choose final track (WAV or MP3)",
         filters: [
           {
             name: "Audio",
@@ -202,12 +313,12 @@ async function runVerification() {
     handleProgress({
       percent: 1,
       stage_label: "Complete",
-      message: "Verification complete",
+      message: "Done",
       step: "complete",
     });
     renderResult(result);
   } catch (err) {
-    stageLabel.textContent = "Failed";
+    stageLabel.textContent = "Stopped";
     renderError(String(err));
   } finally {
     running = false;
@@ -217,7 +328,7 @@ async function runVerification() {
 
 async function openReport() {
   if (!lastResult?.report_html) {
-    showInlineError("No report yet. Run verification first.");
+    showInlineError("Run a check first.");
     return;
   }
   try {
@@ -229,13 +340,68 @@ async function openReport() {
 
 async function openFolder() {
   if (!lastResult?.report_dir) {
-    showInlineError("No report folder yet. Run verification first.");
+    showInlineError("Run a check first.");
     return;
   }
   try {
     await tauri().opener.revealItemInDir(lastResult.report_json);
   } catch (err) {
     showInlineError(`Open folder failed: ${err}`);
+  }
+}
+
+async function publishVerification() {
+  if (publishing || !lastResult?.report_json) return;
+  publishing = true;
+  publishBtn.disabled = true;
+  publishStatus.textContent = "Publishing…";
+  publishStatus.classList.remove("hidden");
+  publishResult.classList.add("hidden");
+
+  try {
+    const result = await tauri().core.invoke("publish_verification", {
+      reportJson: lastResult.report_json,
+      artistName: artistInput.value.trim(),
+      songTitle: songInput.value.trim(),
+    });
+    renderPublishResult(result);
+  } catch (err) {
+    publishStatus.textContent = String(err);
+    publishStatus.classList.remove("hidden");
+  } finally {
+    publishing = false;
+    updatePublishState();
+  }
+}
+
+async function openPublishedPage() {
+  if (!lastPublish?.url) return;
+  try {
+    await tauri().opener.openUrl(lastPublish.url);
+  } catch (err) {
+    showInlineError(`Open page failed: ${err}`);
+  }
+}
+
+async function openPublishedQr() {
+  if (!lastPublish?.qr_url) return;
+  try {
+    await tauri().opener.openUrl(lastPublish.qr_url);
+  } catch (err) {
+    showInlineError(`Open QR failed: ${err}`);
+  }
+}
+
+async function copyPublishedUrl() {
+  if (!lastPublish?.url) return;
+  try {
+    await navigator.clipboard.writeText(lastPublish.url);
+    copyUrlBtn.textContent = "Copied";
+    setTimeout(() => {
+      copyUrlBtn.textContent = "Copy link";
+    }, 1500);
+  } catch (err) {
+    showInlineError(`Copy failed: ${err}`);
   }
 }
 
@@ -252,6 +418,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   runButton.addEventListener("click", runVerification);
   openReportBtn.addEventListener("click", openReport);
   openFolderBtn.addEventListener("click", openFolder);
+  publishBtn.addEventListener("click", publishVerification);
+  artistInput.addEventListener("input", updatePublishState);
+  songInput.addEventListener("input", updatePublishState);
+  openPageBtn.addEventListener("click", openPublishedPage);
+  openQrBtn.addEventListener("click", openPublishedQr);
+  copyUrlBtn.addEventListener("click", copyPublishedUrl);
 
   await tauri().event.listen("verify-progress", (event) => {
     handleProgress(event.payload);

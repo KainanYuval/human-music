@@ -8,11 +8,17 @@ description = "DAW project ↔ released audio provenance verifier"
 name = "gb-verify"
 path = "src/main.rs"
 
+[[bin]]
+name = "coverage-compare"
+path = "src/bin/coverage_compare.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 garageband = { path = "../daw_interfaces/garageband" }
+shazam_engine = { path = "../shazam_engine" }
+rayon = "1"
 hound = "3"
 rustfft = "6"
 serde = { version = "1", features = ["derive"] }

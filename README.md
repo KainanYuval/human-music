@@ -1,29 +1,26 @@
 # Human Music
 
-Verify that released audio was produced from a DAW project — starting with GarageBand `.band` bundles.
+Verify that released audio was produced from a GarageBand `.band` project.
 
 ## Layout
 
 ```
-human_music/
-├── project/          # specs, experiments, scripts
-├── data/             # example projects, benchmarks, reports
-└── src/
-    ├── app/                  # Tauri desktop UI
-    ├── verification_engine/  # provenance pipeline (CLI: gb-verify)
-    └── daw_interfaces/
-        └── garageband/       # .band scanner + metadata
+src/
+├── app/                  # Tauri desktop UI (“Human Music”)
+├── verification_engine/  # gb-verify CLI + library
+├── shazam_engine/        # fingerprint matcher
+└── daw_interfaces/
+    └── garageband/       # .band scanner
 ```
 
 ## Quick start
 
-**CLI** — verify a project against released audio:
+**CLI:**
 
 ```bash
-cargo run -p verification_engine --release -- \
-  --catalog-dir data/ \
-  --project data/example_1/'כל מה .band' \
-  --audio   data/example_1/'כל מה  - 21:06:2026, 18.49.mp3' \
+cargo run -p verification_engine --bin gb-verify --release -- \
+  --project "/path/to/session.band" \
+  --audio   "/path/to/release.mp3" \
   --out     /tmp/gb-report
 ```
 
@@ -33,22 +30,17 @@ cargo run -p verification_engine --release -- \
 cd src/app && npm install && npm run dev
 ```
 
-## Crates
-
-| Crate | Path | Role |
-|-------|------|------|
-| `garageband` | `src/daw_interfaces/garageband` | Parse `.band` bundles, collect GB metadata |
-| `verification_engine` | `src/verification_engine` | Normalize → chroma match → coverage → verdict |
-| `gb-verify-app` | `src/app/src-tauri` | File pickers, progress UI, in-process verify |
-
 ## Pipeline
 
-```mermaid
-flowchart LR
-    GB[garageband scan] --> NE[normalize audio]
-    NE --> CH[chroma match]
-    CH --> CO[timeline coverage]
-    CO --> VD[verdict + report]
-```
+Scan `.band` stems → normalize audio → Shazam-style fingerprint match → timeline coverage → PASS/FAIL + JSON/HTML report.
 
-Decisions and rationale live in [`project/running_spec.md`](project/running_spec.md).
+## Crates
+
+| Crate | Role |
+|-------|------|
+| `garageband` | Parse GarageBand bundles |
+| `shazam_engine` | Landmark fingerprints |
+| `verification_engine` | Full verification pipeline (`gb-verify`) |
+| `gb-verify-app` | Desktop shell |
+
+Build everything from the repo root: `cargo build --workspace`.

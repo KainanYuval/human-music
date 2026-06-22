@@ -2,13 +2,11 @@ target/
 src/**/target/
 src/app/node_modules/
 .DS_Store
+.opencomm/
 
-# Generated verifier outputs
-data/**/report/
-data/**/report_*/
-data/**/normalized_temp/
-data/**/benchmark/
-data/**/cli_bench/
-data/cross_check/
-data/cross_check_v2/
-data/matrix_full/
+# Local-only (not in this repo)
+/data/
+/benchmarks/
+/project/
+/web/
+PROGRESS.md

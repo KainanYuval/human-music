@@ -3,9 +3,16 @@ resolver = "2"
 members = [
     "src/daw_interfaces/garageband",
     "src/verification_engine",
+    "src/shazam_engine",
     "src/app/src-tauri",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+# FFT-heavy crates run optimized even in `tauri dev` (debug) builds.
+[profile.dev.package.shazam_engine]
+opt-level = 3
+[profile.dev.package.verification_engine]
+opt-level = 3

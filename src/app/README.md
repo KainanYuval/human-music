@@ -1,7 +1,9 @@
-# Tauri + Vanilla
+# Human Music (desktop)
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Javascript.
+Tauri app for local GarageBand verification and registry publish.
 
-## Recommended IDE Setup
+```bash
+cd src/app && npm install && npm run dev
+```
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+Rust commands: `run_verification`, `publish_verification`. File pickers use the frontend Tauri dialog plugin.

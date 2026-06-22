@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 pub const STAGE_SCAN: &str = "scan";
 pub const STAGE_NORMALIZE: &str = "normalize";
@@ -10,21 +11,28 @@ pub const STAGE_METADATA: &str = "metadata";
 pub const STAGE_REPORT: &str = "report";
 pub const STAGE_DONE: &str = "done";
 
-// Calibrated so overall percent tracks wall time on typical projects.
-// ffmpeg normalize dominates; chroma/match/coverage scale with duration × asset count.
-const W_NORM_PER_SEC: f64 = 0.92;
-const W_LOAD_PER_SEC: f64 = 0.012;
-const W_CHROMA_PER_SEC: f64 = 0.095;
-const W_MATCH_PER_ASSET: f64 = 0.10;
-const W_MATCH_TARGET_SEC: f64 = 0.00035;
-const W_COV_WINDOW_ASSET: f64 = 0.00032;
-const W_SCAN: f64 = 0.35;
-const W_METADATA_BASE: f64 = 0.20;
-const W_METADATA_PER_FILE: f64 = 0.006;
-const W_REPORT: f64 = 0.12;
+// Progress bar units — one bump per discrete work item (stem, window, file, …).
+pub const U_SCAN: f64 = 2.0;
+pub const U_PROBE: f64 = 1.0;
+pub const U_NORM: f64 = 8.0;
+pub const U_FP: f64 = 5.0;
+pub const U_MATCH: f64 = 2.0;
+pub const U_COV: f64 = 0.18;
+pub const U_META: f64 = 0.5;
+pub const U_REPORT: f64 = 1.0;
 
-/// Rough wall-time estimate: total work units / this ≈ seconds.
-pub const UNITS_PER_SECOND: f64 = 28.0;
+// Wall-time estimate (ETA label only).
+const SECS_SCAN_BASE: f64 = 0.06;
+const SECS_PROBE_PER_FILE: f64 = 0.003;
+const SECS_NORM_PER_TARGET_SEC: f64 = 0.014;
+const SECS_FP_PER_AUDIO_SEC: f64 = 0.00045;
+const SECS_FP_PER_FILE: f64 = 0.006;
+const SECS_MATCH_PER_STEM: f64 = 0.005;
+const SECS_MATCH_TARGET_PER_STEM: f64 = 0.000025;
+const SECS_COV_PER_WINDOW_PER_STEM: f64 = 0.000007;
+const SECS_METADATA_BASE: f64 = 0.10;
+const SECS_METADATA_PER_FILE: f64 = 0.003;
+const SECS_REPORT: f64 = 0.05;
 
 fn stage_label(stage: &str) -> &'static str {
     match stage {
@@ -40,101 +48,124 @@ fn stage_label(stage: &str) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanSummary {
+    pub song_seconds: f64,
+    pub stem_count: usize,
+    pub stem_seconds_total: f64,
+    pub fingerprint_audio_seconds: f64,
+    pub estimated_seconds: f64,
+    pub total_work_items: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkPlan {
-    pub total_units: f64,
-    pub scan_units: f64,
-    pub norm_target_units: f64,
-    pub norm_asset_units: Vec<f64>,
-    pub load_target_units: f64,
-    pub chroma_target_units: f64,
-    pub load_asset_units: Vec<f64>,
-    pub chroma_asset_units: Vec<f64>,
-    pub match_units: f64,
-    pub coverage_units: f64,
-    pub metadata_units: f64,
-    pub report_units: f64,
     pub target_seconds: f64,
     pub asset_seconds: Vec<f64>,
+    pub stem_count: usize,
+    pub stem_seconds_total: f64,
+    pub needs_target_normalize: bool,
+    pub fingerprint_audio_seconds: f64,
+    pub window_count: usize,
+    pub fp_item_count: usize,
+    pub total_units: f64,
+    pub total_seconds: f64,
 }
 
 impl WorkPlan {
-    pub fn estimate(target_seconds: f64, asset_seconds: &[f64]) -> Self {
+    pub fn total_units_for(stem_count: usize, window_count: usize, needs_norm: bool) -> f64 {
+        let n = stem_count;
+        let fp_items = n + 1;
+        U_SCAN
+            + (n + 1) as f64 * U_PROBE
+            + if needs_norm { U_NORM } else { 0.0 }
+            + fp_items as f64 * U_FP
+            + n as f64 * U_MATCH
+            + window_count as f64 * U_COV
+            + (n + 3) as f64 * U_META
+            + 3.0 * U_REPORT
+    }
+
+    pub fn estimate(
+        target_seconds: f64,
+        asset_seconds: &[f64],
+        needs_target_normalize: bool,
+    ) -> Self {
         let target_seconds = target_seconds.max(0.1);
-        let n = asset_seconds.len().max(1);
+        let n = asset_seconds.len();
+        let stem_seconds_total: f64 = asset_seconds.iter().map(|&s| s.max(0.1)).sum();
+        let fingerprint_audio_seconds = target_seconds + stem_seconds_total;
+        let window_count = ((target_seconds / 0.5).ceil() as usize).max(1);
+        let fp_item_count = n + 1;
+        let total_units = Self::total_units_for(n, window_count, needs_target_normalize);
 
-        let norm_target_units = target_seconds * W_NORM_PER_SEC;
-        let norm_asset_units: Vec<f64> = asset_seconds
+        let scan_seconds = SECS_SCAN_BASE + (n + 1) as f64 * SECS_PROBE_PER_FILE;
+        let normalize_seconds = if needs_target_normalize {
+            target_seconds * SECS_NORM_PER_TARGET_SEC
+        } else {
+            0.0
+        };
+        let cores = rayon::current_num_threads().max(1) as f64;
+        let max_stem = asset_seconds
             .iter()
-            .map(|&s| s.max(0.1) * W_NORM_PER_SEC)
-            .collect();
-
-        let load_target_units = target_seconds * W_LOAD_PER_SEC;
-        let chroma_target_units = target_seconds * W_CHROMA_PER_SEC;
-        let load_asset_units: Vec<f64> = asset_seconds
-            .iter()
-            .map(|&s| s.max(0.1) * W_LOAD_PER_SEC)
-            .collect();
-        let chroma_asset_units: Vec<f64> = asset_seconds
-            .iter()
-            .map(|&s| s.max(0.1) * W_CHROMA_PER_SEC)
-            .collect();
-
-        let windows = (target_seconds / 0.5).ceil().max(1.0);
-        let coverage_units = windows * n as f64 * W_COV_WINDOW_ASSET;
-
-        let match_units =
-            n as f64 * (W_MATCH_PER_ASSET + target_seconds * W_MATCH_TARGET_SEC);
-
-        let metadata_units =
-            W_METADATA_BASE + (n + 1) as f64 * W_METADATA_PER_FILE;
-
-        let scan_units = W_SCAN;
-        let report_units = W_REPORT;
-
-        let total_units = scan_units
-            + norm_target_units
-            + norm_asset_units.iter().sum::<f64>()
-            + load_target_units
-            + chroma_target_units
-            + load_asset_units.iter().sum::<f64>()
-            + chroma_asset_units.iter().sum::<f64>()
-            + match_units
-            + coverage_units
-            + metadata_units
-            + report_units;
+            .copied()
+            .fold(0.0f64, |m, s| m.max(s.max(0.1)));
+        let parallel_tracks = target_seconds.max(max_stem) + stem_seconds_total / cores;
+        let fingerprint_seconds =
+            parallel_tracks * SECS_FP_PER_AUDIO_SEC + n as f64 * SECS_FP_PER_FILE;
+        let match_seconds =
+            n as f64 * (SECS_MATCH_PER_STEM + target_seconds * SECS_MATCH_TARGET_PER_STEM);
+        let coverage_seconds =
+            window_count as f64 * n as f64 * SECS_COV_PER_WINDOW_PER_STEM;
+        let metadata_seconds = SECS_METADATA_BASE + (n + 1) as f64 * SECS_METADATA_PER_FILE;
+        let report_seconds = SECS_REPORT;
+        let total_seconds = (scan_seconds
+            + normalize_seconds
+            + fingerprint_seconds
+            + match_seconds
+            + coverage_seconds
+            + metadata_seconds
+            + report_seconds)
+            .max(0.25);
 
         Self {
-            total_units,
-            scan_units,
-            norm_target_units,
-            norm_asset_units,
-            load_target_units,
-            chroma_target_units,
-            load_asset_units,
-            chroma_asset_units,
-            match_units,
-            coverage_units,
-            metadata_units,
-            report_units,
             target_seconds,
             asset_seconds: asset_seconds.to_vec(),
+            stem_count: n,
+            stem_seconds_total,
+            needs_target_normalize,
+            fingerprint_audio_seconds,
+            window_count,
+            fp_item_count,
+            total_units: total_units.max(1.0),
+            total_seconds,
         }
     }
 
     pub fn estimated_seconds(&self) -> f64 {
-        self.total_units / UNITS_PER_SECOND
+        self.total_seconds
     }
 
     pub fn summary_detail(&self) -> String {
-        let asset_secs: f64 = self.asset_seconds.iter().sum();
         format!(
-            "~{:.0}s est. · {:.0}s song · {} assets · {:.0}s stems",
-            self.estimated_seconds(),
+            "~{:.1}s est. · {:.1}s song · {} stems · {} fingerprint items · {} work units",
+            self.total_seconds,
             self.target_seconds,
-            self.asset_seconds.len(),
-            asset_secs
+            self.stem_count,
+            self.fp_item_count,
+            self.total_units.round() as u64
         )
+    }
+
+    pub fn plan_summary(&self) -> PlanSummary {
+        PlanSummary {
+            song_seconds: self.target_seconds,
+            stem_count: self.stem_count,
+            stem_seconds_total: self.stem_seconds_total,
+            fingerprint_audio_seconds: self.fingerprint_audio_seconds,
+            estimated_seconds: self.total_seconds,
+            total_work_items: self.total_units,
+        }
     }
 }
 
@@ -159,87 +190,39 @@ pub struct ProgressEvent {
     pub item_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_summary: Option<PlanSummary>,
 }
 
-pub struct ProgressEmitter<'a> {
-    sink: Option<&'a mut dyn FnMut(ProgressEvent)>,
+struct ProgressCore {
+    sink: Option<Box<dyn FnMut(ProgressEvent) + Send>>,
     plan: Option<WorkPlan>,
-    completed: f64,
-    step_base: f64,
-    step_units: f64,
+    completed_units: f64,
 }
 
-impl<'a> ProgressEmitter<'a> {
-    pub fn new(sink: Option<&'a mut dyn FnMut(ProgressEvent)>) -> Self {
-        Self {
-            sink,
-            plan: None,
-            completed: 0.0,
-            step_base: 0.0,
-            step_units: 0.0,
-        }
-    }
-
-    pub fn set_plan(&mut self, plan: WorkPlan) {
-        self.plan = Some(plan);
-    }
-
-    pub fn complete_all(&mut self) {
-        if let Some(plan) = &self.plan {
-            self.completed = plan.total_units;
-        }
-    }
-
-    pub fn plan(&self) -> Option<&WorkPlan> {
-        self.plan.as_ref()
-    }
-
-    pub fn begin_step(&mut self, units: f64) {
-        self.step_base = self.completed;
-        self.step_units = units.max(0.0);
-    }
-
-    pub fn set_step_fraction(&mut self, frac: f64) {
-        let frac = frac.clamp(0.0, 1.0);
-        self.completed = self.step_base + self.step_units * frac;
-    }
-
-    pub fn finish_step(&mut self) {
-        self.completed = self.step_base + self.step_units;
-        self.step_base = self.completed;
-        self.step_units = 0.0;
-    }
-
-    pub fn mark_scan_done(&mut self) {
-        if let Some(plan) = &self.plan {
-            self.completed = plan.scan_units;
-            self.step_base = self.completed;
-        }
-    }
-
+impl ProgressCore {
     fn global_fraction(&self) -> f64 {
         let total = self.plan.as_ref().map(|p| p.total_units).unwrap_or(1.0);
         if total <= 0.0 {
             return 0.0;
         }
-        if self.completed >= total {
+        if self.completed_units >= total {
             return 1.0;
         }
-        (self.completed / total).clamp(0.0, 0.999)
+        (self.completed_units / total).clamp(0.0, 0.999)
     }
 
-    pub fn emit(
+    fn emit(
         &mut self,
         stage: &str,
         step: &str,
         message: impl Into<String>,
-        step_percent: f64,
         detail: Option<String>,
         item_index: Option<usize>,
         item_total: Option<usize>,
         item_name: Option<String>,
+        plan_summary: Option<PlanSummary>,
     ) {
-        let step_percent = step_percent.clamp(0.0, 1.0);
         let global = self.global_fraction();
         let estimated_seconds = self.plan.as_ref().map(|p| p.estimated_seconds());
         let Some(sink) = self.sink.as_mut() else {
@@ -251,7 +234,7 @@ impl<'a> ProgressEmitter<'a> {
             step: step.to_string(),
             percent: (global * 10000.0).round() / 10000.0,
             stage_percent: (global * 10000.0).round() / 10000.0,
-            step_percent: (step_percent * 10000.0).round() / 10000.0,
+            step_percent: (global * 10000.0).round() / 10000.0,
             message: message.into(),
             stage_label: stage_label(stage),
             detail,
@@ -259,31 +242,102 @@ impl<'a> ProgressEmitter<'a> {
             item_total,
             item_name,
             estimated_seconds,
+            plan_summary,
         };
         sink(event);
     }
+}
 
-    pub fn emit_step(
-        &mut self,
+/// Thread-safe progress handle; clone for parallel workers.
+#[derive(Clone)]
+pub struct ProgressHandle {
+    inner: Arc<Mutex<ProgressCore>>,
+}
+
+impl ProgressHandle {
+    pub fn new(sink: Option<Box<dyn FnMut(ProgressEvent) + Send>>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ProgressCore {
+                sink,
+                plan: None,
+                completed_units: 0.0,
+            })),
+        }
+    }
+
+    pub fn set_plan(&self, plan: WorkPlan) {
+        let mut g = self.inner.lock().unwrap();
+        g.plan = Some(plan);
+    }
+
+    pub fn plan(&self) -> Option<WorkPlan> {
+        self.inner.lock().unwrap().plan.clone()
+    }
+
+    pub fn advance_units(&self, delta: f64) {
+        if delta <= 0.0 {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let cap = g.plan.as_ref().map(|p| p.total_units).unwrap_or(f64::MAX);
+        g.completed_units = (g.completed_units + delta).min(cap * 0.999);
+    }
+
+    pub fn complete_all(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(plan) = &g.plan {
+            g.completed_units = plan.total_units;
+        }
+    }
+
+    /// Advance the bar by `units`, then emit one progress event.
+    pub fn tick(
+        &self,
         stage: &str,
         step: &str,
         message: impl Into<String>,
-        step_frac: f64,
+        units: f64,
         detail: Option<String>,
         item_index: Option<usize>,
         item_total: Option<usize>,
         item_name: Option<String>,
+        plan_summary: Option<PlanSummary>,
     ) {
-        self.set_step_fraction(step_frac);
-        self.emit(
+        self.advance_units(units);
+        let mut g = self.inner.lock().unwrap();
+        g.emit(
             stage,
             step,
             message,
-            step_frac,
             detail,
             item_index,
             item_total,
             item_name,
+            plan_summary,
+        );
+    }
+
+    pub fn emit(
+        &self,
+        stage: &str,
+        step: &str,
+        message: impl Into<String>,
+        detail: Option<String>,
+        item_index: Option<usize>,
+        item_total: Option<usize>,
+        item_name: Option<String>,
+        plan_summary: Option<PlanSummary>,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        g.emit(
+            stage,
+            step,
+            message,
+            detail,
+            item_index,
+            item_total,
+            item_name,
+            plan_summary,
         );
     }
 }
@@ -300,16 +354,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_project_weights_normalize_heaviest() {
-        let plan = WorkPlan::estimate(240.0, &vec![30.0; 50]);
-        let norm: f64 = plan.norm_target_units + plan.norm_asset_units.iter().sum::<f64>();
-        assert!(norm / plan.total_units > 0.65);
+    fn each_stem_gets_equal_fp_weight() {
+        let plan = WorkPlan::estimate(60.0, &vec![10.0; 50], false);
+        let fp_share = 51.0 * U_FP / plan.total_units;
+        assert!(fp_share > 0.35);
+        assert!((U_FP / plan.total_units) > 0.008);
     }
 
     #[test]
-    fn longer_song_increases_total() {
-        let short = WorkPlan::estimate(60.0, &vec![10.0; 5]);
-        let long = WorkPlan::estimate(600.0, &vec![10.0; 5]);
-        assert!(long.total_units > short.total_units * 3.0);
+    fn longer_song_increases_estimate() {
+        let short = WorkPlan::estimate(60.0, &vec![10.0; 5], false);
+        let long = WorkPlan::estimate(600.0, &vec![10.0; 5], false);
+        assert!(long.total_seconds > short.total_seconds * 2.0);
     }
 }

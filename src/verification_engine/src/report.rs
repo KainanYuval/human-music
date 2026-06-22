@@ -47,17 +47,26 @@ pub fn build_report_payload(
     asset_hashes: HashMap<String, String>,
     config: &VerifyConfig,
 ) -> Result<serde_json::Value> {
-    let claim = if config.discrimination.enabled {
-        "This released audio is uniquely explained by this GarageBand project versus rival projects in the catalog."
-    } else {
-        "This released audio is strongly explained by recordings found inside this GarageBand project."
-    };
+    let claim = "This released audio is explained by recordings found inside this GarageBand project.";
 
     let unused: Vec<&str> = matches
         .iter()
         .filter(|m| m.status == "no_match")
         .map(|m| m.asset.as_str())
         .collect();
+
+    let timeline_ratio = timeline_coverage
+        .get("coverage_ratio")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(verdict.coverage_ratio);
+    let timeline_explained = timeline_coverage
+        .get("explained_seconds")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(verdict.matched_coverage_seconds);
+    let timeline_target = timeline_coverage
+        .get("target_seconds")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(verdict.target_duration_seconds);
 
     let mut payload = serde_json::json!({
         "verifier_version": VERSION,
@@ -67,9 +76,9 @@ pub fn build_report_payload(
         "verdict": verdict.verdict,
         "provenance_score": verdict.provenance_score,
         "coverage": {
-            "matched_seconds": verdict.matched_coverage_seconds,
-            "target_seconds": verdict.target_duration_seconds,
-            "ratio": verdict.coverage_ratio,
+            "matched_seconds": timeline_explained,
+            "target_seconds": timeline_target,
+            "ratio": timeline_ratio,
         },
         "timeline_coverage": timeline_coverage,
         "project_name": scan.project_name,

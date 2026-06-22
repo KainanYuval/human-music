@@ -1,78 +1,87 @@
 pub mod audio;
-pub mod catalog;
 pub mod chroma;
 pub mod config;
 pub mod coverage;
-pub mod discrimination;
+pub mod fingerprints;
 pub mod matcher;
 pub mod normalize;
 pub mod progress;
-pub mod project_features;
 pub mod report;
 pub mod verdict;
+pub mod waveform;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use coverage::compute_timeline_coverage;
-use matcher::match_all_assets;
+use coverage::{compute_timeline_coverage, gate_timeline_by_matches};
+use fingerprints::{
+    fingerprint_target_and_stems_parallel_with_progress, FingerprintItemDone,
+};
+use matcher::{build_asset_indexes, match_all_assets_with_progress, MatchItemDone};
 use garageband::metadata::{collect_metadata, project_manifest_hash, sha256_file};
-use normalize::{media_duration_seconds, normalize_to_wav_with_progress, TARGET_SR};
+use normalize::{media_duration_seconds, normalize_to_wav_with_progress};
+use shazam_engine::{build_index, default_cache_dir, Fingerprint};
 use progress::{
-    ProgressEmitter, ProgressEvent, WorkPlan, STAGE_DONE, STAGE_FEATURES, STAGE_MATCH,
-    STAGE_METADATA, STAGE_NORMALIZE, STAGE_REPORT, STAGE_SCAN,
+    ProgressHandle, ProgressEvent, WorkPlan, U_FP, U_MATCH, U_META, U_NORM, U_PROBE, U_REPORT,
+    U_SCAN, STAGE_DONE, STAGE_FEATURES, STAGE_MATCH, STAGE_METADATA, STAGE_NORMALIZE,
+    STAGE_REPORT, STAGE_SCAN,
 };
 use report::{build_report_payload, write_html_report, write_json_report};
 use garageband::{scan_project, scan_summary};
-use catalog::discover_band_projects;
 use config::VerifyConfig;
-use discrimination::{compute_project_competition, passes_discrimination};
-use project_features::load_project_chromas;
-use verdict::{compute_verdict_discriminated, compute_verdict_monolithic};
+use verdict::compute_verdict_monolithic;
+
+fn is_wav(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("wav"))
+}
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
     pub config: VerifyConfig,
-    /// Directory to scan for rival `.band` projects (e.g. `data/`)
-    pub catalog_dir: Option<PathBuf>,
 }
 
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
             config: VerifyConfig::default(),
-            catalog_dir: None,
         }
     }
 }
 
-pub fn run_verify(
+pub fn run_verify<F>(
     project: &Path,
     audio: &Path,
     out: &Path,
-    on_progress: Option<&mut dyn FnMut(ProgressEvent)>,
-) -> Result<serde_json::Value> {
-    run_verify_with_options(
-        project,
-        audio,
-        out,
-        VerifyOptions::default(),
-        on_progress,
-    )
+    on_progress: Option<F>,
+) -> Result<serde_json::Value>
+where
+    F: FnMut(ProgressEvent) + Send + 'static,
+{
+    run_verify_with_options(project, audio, out, VerifyOptions::default(), on_progress)
 }
 
-pub fn run_verify_with_options(
+pub fn run_verify_with_options<F>(
     project: &Path,
     audio: &Path,
     out: &Path,
     options: VerifyOptions,
-    on_progress: Option<&mut dyn FnMut(ProgressEvent)>,
-) -> Result<serde_json::Value> {
-    let mut progress = ProgressEmitter::new(on_progress);
-    run_verify_inner(project, audio, out, &options, &mut progress)
+    on_progress: Option<F>,
+) -> Result<serde_json::Value>
+where
+    F: FnMut(ProgressEvent) + Send + 'static,
+{
+    let handle = ProgressHandle::new(
+        on_progress.map(|f| Box::new(f) as Box<dyn FnMut(ProgressEvent) + Send>),
+    );
+    run_verify_inner(project, audio, out, &options, &handle)
 }
 
 fn run_verify_inner(
@@ -80,15 +89,15 @@ fn run_verify_inner(
     audio: &Path,
     out: &Path,
     options: &VerifyOptions,
-    progress: &mut ProgressEmitter<'_>,
+    progress: &ProgressHandle,
 ) -> Result<serde_json::Value> {
     let config = &options.config;
     progress.emit(
         STAGE_SCAN,
         "start",
         "Opening GarageBand project bundle",
-        0.0,
         Some(project.display().to_string()),
+        None,
         None,
         None,
         None,
@@ -102,472 +111,389 @@ fn run_verify_inner(
         );
     }
 
-    progress.emit(
+    let asset_total = scan.audio_assets.len();
+    let probe_total = asset_total + 1;
+    let audio_name = audio.file_name().map(|n| n.to_string_lossy().to_string());
+    let needs_normalize = !is_wav(audio);
+
+    let probed_target = media_duration_seconds(audio).unwrap_or(180.0);
+    let placeholder_assets = vec![30.0; asset_total];
+    progress.set_plan(WorkPlan::estimate(
+        probed_target,
+        &placeholder_assets,
+        needs_normalize,
+    ));
+
+    progress.tick(
         STAGE_SCAN,
         "assets",
         "Found embedded recordings",
-        1.0,
+        U_SCAN,
         Some(format!(
-            "{} files · {} registered in MetaData.plist",
+            "{} stems · {} registered in MetaData.plist",
             scan.audio_assets.len(),
             scan.registered_assets.len()
         )),
         None,
-        Some(scan.audio_assets.len()),
-        None,
-    );
-
-    progress.emit(
-        STAGE_SCAN,
-        "probe",
-        "Measuring audio durations for time estimate",
-        0.0,
-        None,
-        None,
-        None,
-        None,
-    );
-    let probed_target = media_duration_seconds(audio).unwrap_or(180.0);
-    let probed_assets: Vec<f64> = scan
-        .audio_assets
-        .iter()
-        .map(|p| media_duration_seconds(p).unwrap_or(30.0))
-        .collect();
-    let plan = WorkPlan::estimate(probed_target, &probed_assets);
-    let plan_detail = plan.summary_detail();
-    progress.set_plan(plan);
-    progress.mark_scan_done();
-
-    progress.emit(
-        STAGE_SCAN,
-        "done",
-        "Project scan complete",
-        1.0,
-        Some(plan_detail),
-        None,
-        None,
-        scan.garageband_version.clone(),
-    );
-
-    let plan = progress.plan().expect("work plan set after scan").clone();
-
-    std::fs::create_dir_all(out)?;
-    let temp_dir = out.join("normalized_temp");
-    std::fs::create_dir_all(&temp_dir)?;
-
-    let asset_total = scan.audio_assets.len();
-    let audio_name = audio.file_name().map(|n| n.to_string_lossy().to_string());
-
-    progress.begin_step(plan.norm_target_units);
-    progress.emit(
-        STAGE_NORMALIZE,
-        "target_start",
-        "Converting released audio to mono 44.1 kHz",
-        0.0,
-        audio_name.clone(),
-        None,
-        None,
-        audio_name.clone(),
-    );
-    let target_norm_path = temp_dir.join("target.wav");
-    {
-        let mut ffmpeg_progress = |frac: f64| {
-            progress.emit_step(
-                STAGE_NORMALIZE,
-                "target_ffmpeg",
-                "Transcoding released audio",
-                frac,
-                None,
-                None,
-                None,
-                audio_name.clone(),
-            );
-        };
-        normalize_to_wav_with_progress(audio, &target_norm_path, Some(&mut ffmpeg_progress))?;
-    }
-    progress.finish_step();
-    progress.emit(
-        STAGE_NORMALIZE,
-        "target_done",
-        "Released audio normalized",
-        1.0,
-        Some(target_norm_path.display().to_string()),
-        None,
-        None,
-        audio_name.clone(),
-    );
-
-    let mut asset_norm: HashMap<PathBuf, PathBuf> = HashMap::new();
-    for (idx, source) in scan.audio_assets.iter().enumerate() {
-        let name = source.file_name().unwrap().to_string_lossy().to_string();
-
-        progress.begin_step(plan.norm_asset_units[idx]);
-        progress.emit(
-            STAGE_NORMALIZE,
-            "asset_start",
-            "Normalizing project recording",
-            0.0,
-            Some(source.display().to_string()),
-            Some(idx),
-            Some(asset_total),
-            Some(name.clone()),
-        );
-
-        let safe: String = source
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let dest = temp_dir.join(format!("asset_{idx:03}_{safe}.wav"));
-        {
-            let mut ffmpeg_progress = |frac: f64| {
-                progress.emit_step(
-                    STAGE_NORMALIZE,
-                    "asset_ffmpeg",
-                    "Transcoding project recording",
-                    frac,
-                    None,
-                    Some(idx),
-                    Some(asset_total),
-                    Some(name.clone()),
-                );
-            };
-            normalize_to_wav_with_progress(source, &dest, Some(&mut ffmpeg_progress))?;
-        }
-        asset_norm.insert(source.clone(), dest);
-        progress.finish_step();
-
-        progress.emit(
-            STAGE_NORMALIZE,
-            "asset_done",
-            "Recording normalized",
-            1.0,
-            None,
-            Some(idx),
-            Some(asset_total),
-            Some(name),
-        );
-    }
-
-    progress.begin_step(plan.load_target_units);
-    progress.emit(
-        STAGE_FEATURES,
-        "target_load",
-        "Loading normalized released audio",
-        0.0,
-        None,
-        None,
-        None,
-        None,
-    );
-    let (target_audio, sr) = audio::load_mono_float(&target_norm_path)?;
-    progress.finish_step();
-    if sr != TARGET_SR {
-        anyhow::bail!("unexpected sample rate after normalization: {sr}");
-    }
-    let target_duration = target_audio.len() as f64 / sr as f64;
-
-    progress.begin_step(plan.chroma_target_units);
-    progress.emit(
-        STAGE_FEATURES,
-        "target_chroma",
-        "Computing pitch fingerprint for released audio",
-        0.0,
-        Some(format!("{target_duration:.1}s · {sr} Hz")),
-        None,
-        None,
-        audio_name.clone(),
-    );
-    let target_chroma = {
-        let mut chroma_progress = |frac: f64| {
-            progress.emit_step(
-                STAGE_FEATURES,
-                "target_chroma",
-                "Computing pitch fingerprint for released audio",
-                frac,
-                Some(format!("{:.0}% of STFT frames", frac * 100.0)),
-                None,
-                None,
-                audio_name.clone(),
-            );
-        };
-        chroma::chroma_matrix_with_progress(&target_audio, sr, Some(&mut chroma_progress))
-    };
-    progress.finish_step();
-    progress.emit(
-        STAGE_FEATURES,
-        "target_chroma_done",
-        "Released audio fingerprint ready",
-        1.0,
-        Some(format!("{} chroma frames", target_chroma.frames)),
-        None,
-        None,
-        None,
-    );
-
-    let mut asset_chromas: HashMap<String, chroma::ChromaMatrix> = HashMap::new();
-    let mut asset_durations: HashMap<String, f64> = HashMap::new();
-    for (idx, (source, normalized)) in asset_norm.iter().enumerate() {
-        let name = source.file_name().unwrap().to_string_lossy().to_string();
-
-        progress.begin_step(plan.load_asset_units[idx]);
-        progress.emit(
-            STAGE_FEATURES,
-            "asset_load",
-            "Loading project recording",
-            0.0,
-            None,
-            Some(idx),
-            Some(asset_total),
-            Some(name.clone()),
-        );
-        let (samples, _) = audio::load_mono_float(normalized)?;
-        progress.finish_step();
-        let duration = samples.len() as f64 / sr as f64;
-
-        progress.begin_step(plan.chroma_asset_units[idx]);
-        progress.emit(
-            STAGE_FEATURES,
-            "asset_chroma",
-            "Computing pitch fingerprint",
-            0.0,
-            Some(format!("{duration:.1}s")),
-            Some(idx),
-            Some(asset_total),
-            Some(name.clone()),
-        );
-        let matrix = {
-            let mut chroma_progress = |frac: f64| {
-                progress.emit_step(
-                    STAGE_FEATURES,
-                    "asset_chroma",
-                    "Computing pitch fingerprint",
-                    frac,
-                    Some(format!("{:.0}% of STFT frames", frac * 100.0)),
-                    Some(idx),
-                    Some(asset_total),
-                    Some(name.clone()),
-                );
-            };
-            chroma::chroma_matrix_with_progress(&samples, sr, Some(&mut chroma_progress))
-        };
-        progress.finish_step();
-        asset_chromas.insert(name.clone(), matrix);
-        asset_durations.insert(name.clone(), duration);
-
-        progress.emit(
-            STAGE_FEATURES,
-            "asset_chroma_done",
-            "Fingerprint ready",
-            1.0,
-            None,
-            Some(idx),
-            Some(asset_total),
-            Some(name),
-        );
-    }
-
-    progress.begin_step(plan.match_units);
-    progress.emit(
-        STAGE_MATCH,
-        "start",
-        "Matching project recordings against released audio",
-        0.0,
-        Some(format!("{asset_total} assets")),
-        None,
         Some(asset_total),
         None,
-    );
-
-    let mut matches = match_all_assets(
-        &asset_norm,
-        &target_chroma,
-        sr,
-        target_duration,
-        &asset_chromas,
-        &asset_durations,
-        &config.match_config,
-    );
-    matches.sort_by(|a, b| {
-        b.match_score
-            .partial_cmp(&a.match_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    for (idx, m) in matches.iter().enumerate() {
-        let step_frac = (idx + 1) as f64 / matches.len().max(1) as f64;
-        progress.emit_step(
-            STAGE_MATCH,
-            "asset_result",
-            "Asset match scored",
-            step_frac,
-            Some(format!(
-                "score {:.3} · {} · offset {:.2}s",
-                m.match_score, m.status, m.offset_seconds
-            )),
-            Some(idx),
-            Some(matches.len()),
-            Some(m.asset.clone()),
-        );
-    }
-    progress.finish_step();
-
-    let asset_chroma_list: Vec<chroma::ChromaMatrix> = scan
-        .audio_assets
-        .iter()
-        .map(|p| {
-            asset_chromas
-                .get(&p.file_name().unwrap().to_string_lossy().to_string())
-                .cloned()
-                .unwrap()
-        })
-        .collect();
-
-    let coverage_opts = coverage::CoverageOptions::from(&config.coverage);
-
-    let timeline = compute_timeline_coverage(
-        target_duration,
-        &target_chroma,
-        &asset_chroma_list,
-        sr,
-        coverage_opts.clone(),
-        progress,
-    );
-
-    let catalog_root = options.catalog_dir.clone().or_else(|| {
-        project
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-    });
-
-    let verdict = if config.discrimination.enabled {
-        let catalog_root = catalog_root.context(
-            "discrimination requires --catalog-dir (folder containing rival .band projects)",
-        )?;
-        let rivals = discover_band_projects(&catalog_root, project);
-        if rivals.is_empty() {
-            anyhow::bail!(
-                "discrimination enabled but no rival .band projects found under {}",
-                catalog_root.display()
-            );
-        }
-
-        let catalog_temp = temp_dir.join("catalog_chromas");
-        std::fs::create_dir_all(&catalog_temp)?;
-
-        let mut catalog_projects = Vec::new();
-        for (idx, rival_path) in rivals.iter().enumerate() {
-            let label = format!("rival_{idx:02}");
-            catalog_projects.push(load_project_chromas(rival_path, &catalog_temp, &label)?);
-        }
-
-        let claimed_name = scan.project_name.clone();
-        let mut all_projects: Vec<(String, Vec<chroma::ChromaMatrix>)> = Vec::new();
-        all_projects.push((claimed_name.clone(), asset_chroma_list.clone()));
-        for cp in &catalog_projects {
-            all_projects.push((cp.name.clone(), cp.asset_chromas.clone()));
-        }
-
-        let claimed_index = 0usize;
-        let project_refs: Vec<(&str, &[chroma::ChromaMatrix])> = all_projects
-            .iter()
-            .map(|(name, chromas)| (name.as_str(), chromas.as_slice()))
-            .collect();
-
-        let (competitive, rival_fits) = compute_project_competition(
-            &target_chroma,
-            &project_refs,
-            claimed_index,
-            sr,
-            config.coverage.window_seconds,
-            config.coverage.hop_seconds,
-            config.coverage.window_score_min,
-            config.discrimination.competitive_margin,
-        );
-
-        let discrimination_pass = passes_discrimination(
-            &competitive,
-            &rival_fits,
-            &config.discrimination,
-        );
-
-        compute_verdict_discriminated(
-            &matches,
-            &timeline,
-            &competitive,
-            rival_fits,
-            discrimination_pass,
-            config.verdict.pass_coverage_min,
-            config.verdict.require_strong_match,
-        )
-    } else {
-        compute_verdict_monolithic(
-            &matches,
-            &timeline,
-            config.verdict.pass_coverage_min,
-            config.verdict.require_strong_match,
-        )
-    };
-
-    progress.begin_step(plan.metadata_units);
-    progress.emit(
-        STAGE_METADATA,
-        "hash",
-        "Computing file hashes",
-        0.0,
-        None,
-        None,
-        None,
         None,
     );
-    let asset_hashes: HashMap<String, String> = scan
+
+    progress.tick(
+        STAGE_SCAN,
+        "probe_target",
+        "Song duration measured",
+        U_PROBE,
+        Some(format!("{probed_target:.1}s release")),
+        Some(0),
+        Some(probe_total),
+        audio_name.clone(),
+        None,
+    );
+
+    let probed_assets: Vec<f64> = scan
         .audio_assets
         .iter()
         .enumerate()
         .map(|(idx, p)| {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
-            progress.emit_step(
-                STAGE_METADATA,
-                "hash_asset",
-                "Hashing project recording",
-                (idx + 1) as f64 / asset_total.max(1) as f64,
+            let dur = media_duration_seconds(p).unwrap_or(30.0);
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+            progress.tick(
+                STAGE_SCAN,
+                "probe_stem",
+                "Stem duration measured",
+                U_PROBE,
+                Some(format!("{dur:.1}s")),
+                Some(idx + 1),
+                Some(probe_total),
+                name,
                 None,
-                Some(idx),
-                Some(asset_total),
-                Some(name.clone()),
             );
-            Ok((name, sha256_file(p)?))
+            dur
         })
-        .collect::<Result<_>>()?;
+        .collect();
+
+    let plan = WorkPlan::estimate(probed_target, &probed_assets, needs_normalize);
+    let plan_summary = plan.plan_summary();
+    let plan_detail = plan.summary_detail();
+    progress.set_plan(plan);
+
+    progress.emit(
+        STAGE_SCAN,
+        "done",
+        "Scan complete — work plan ready",
+        Some(plan_detail),
+        None,
+        None,
+        scan.garageband_version.clone(),
+        Some(plan_summary),
+    );
+
+    let plan = progress.plan().expect("work plan set after scan");
+
+    std::fs::create_dir_all(out)?;
+    let temp_dir = out.join("normalized_temp");
+    std::fs::create_dir_all(&temp_dir)?;
+    let fp_cache_dir = default_cache_dir();
+    std::fs::create_dir_all(&fp_cache_dir)?;
+
+    let target_fp_path = if is_wav(audio) {
+        audio.to_path_buf()
+    } else {
+        progress.emit(
+            STAGE_NORMALIZE,
+            "target_start",
+            "Converting released audio to mono WAV",
+            audio_name.clone(),
+            None,
+            None,
+            audio_name.clone(),
+            None,
+        );
+        let target_norm_path = temp_dir.join("target.wav");
+        let progress_norm = progress.clone();
+        let audio_name_norm = audio_name.clone();
+        let norm_done = Arc::new(Mutex::new(0.0f64));
+        let mut ffmpeg_progress = move |frac: f64| {
+            let target_units = U_NORM * frac;
+            let mut last = norm_done.lock().unwrap();
+            let delta = target_units - *last;
+            *last = target_units;
+            drop(last);
+            if delta > 0.0 {
+                progress_norm.tick(
+                    STAGE_NORMALIZE,
+                    "target_ffmpeg",
+                    "Transcoding released audio",
+                    delta,
+                    None,
+                    None,
+                    None,
+                    audio_name_norm.clone(),
+                    None,
+                );
+            }
+        };
+        normalize_to_wav_with_progress(audio, &target_norm_path, Some(&mut ffmpeg_progress))?;
+        progress.emit(
+            STAGE_NORMALIZE,
+            "target_done",
+            "Released audio normalized",
+            Some(target_norm_path.display().to_string()),
+            None,
+            None,
+            audio_name.clone(),
+            None,
+        );
+        target_norm_path
+    };
+
+    let target_duration = probed_target;
+
+    progress.emit(
+        STAGE_FEATURES,
+        "fingerprint_start",
+        "Fingerprinting release and project stems",
+        Some(format!(
+            "{} items · {:.0}s audio",
+            plan.fp_item_count, plan.fingerprint_audio_seconds
+        )),
+        None,
+        Some(plan.fp_item_count),
+        audio_name.clone(),
+        None,
+    );
+
+    let progress_fp = progress.clone();
+    let on_fp_done: Arc<dyn Fn(FingerprintItemDone) + Send + Sync> = Arc::new(move |item| {
+        let label = if item.is_target {
+            "Release fingerprinted".to_string()
+        } else {
+            format!("Stem fingerprinted ({}/{})", item.item_index, item.item_total - 1)
+        };
+        progress_fp.tick(
+            STAGE_FEATURES,
+            if item.is_target {
+                "fingerprint_target"
+            } else {
+                "fingerprint_stem"
+            },
+            label,
+            U_FP,
+            Some(format!("{:.1}s audio", item.duration_seconds)),
+            Some(item.item_index),
+            Some(item.item_total),
+            Some(item.name),
+            None,
+        );
+    });
+
+    let (target_fps, stem_results) = fingerprint_target_and_stems_parallel_with_progress(
+        &target_fp_path,
+        &scan.audio_assets,
+        &fp_cache_dir,
+        Some(on_fp_done),
+    )?;
+
+    let target_index = build_index(&target_fps);
+    progress.emit(
+        STAGE_FEATURES,
+        "fingerprint_done",
+        "Fingerprints ready",
+        Some(format!(
+            "{} release landmarks · {} stems",
+            target_fps.len(),
+            stem_results.len()
+        )),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut asset_fps: HashMap<String, Vec<Fingerprint>> = HashMap::new();
+    let mut asset_durations: HashMap<String, f64> = HashMap::new();
+    for stem in stem_results {
+        asset_durations.insert(stem.name.clone(), stem.duration_seconds);
+        asset_fps.insert(stem.name, stem.fingerprints);
+    }
+
+    progress.emit(
+        STAGE_MATCH,
+        "start",
+        "Matching stems to release and scanning timeline",
+        Some(format!(
+            "{asset_total} stems · {:.0}s song · {} windows",
+            target_duration, plan.window_count
+        )),
+        None,
+        Some(asset_total),
+        None,
+        None,
+    );
+
+    let asset_indexes = build_asset_indexes(&scan.audio_assets, &asset_fps);
+    let coverage_opts = coverage::CoverageOptions::from_config(
+        config.coverage.window_seconds,
+        config.coverage.hop_seconds,
+        config.coverage.window_score_min,
+        &config.match_config,
+    );
+    let match_config = config.match_config.clone();
+    let progress_match = progress.clone();
+    let progress_cov = progress.clone();
+    let assets_for_match = scan.audio_assets.clone();
+
+    let on_match_done: Arc<dyn Fn(MatchItemDone) + Send + Sync> = Arc::new(move |item| {
+        progress_match.tick(
+            STAGE_MATCH,
+            "match_stem",
+            "Stem matched to release",
+            U_MATCH,
+            Some(format!("score {:.3}", item.match_score)),
+            Some(item.item_index),
+            Some(item.item_total),
+            Some(item.name),
+            None,
+        );
+    });
+
+    let (matches, timeline_raw) = rayon::join(
+        move || {
+            let mut results = match_all_assets_with_progress(
+                &assets_for_match,
+                &target_index,
+                target_duration,
+                &asset_fps,
+                &asset_durations,
+                &match_config,
+                Some(on_match_done),
+            );
+            results.sort_by(|a, b| {
+                b.match_score
+                    .partial_cmp(&a.match_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results
+        },
+        move || {
+            compute_timeline_coverage(
+                target_duration,
+                &target_fps,
+                &asset_indexes,
+                coverage_opts,
+                Some(&progress_cov),
+            )
+        },
+    );
+
+    let timeline = gate_timeline_by_matches(timeline_raw, &matches);
+
+    progress.emit(
+        STAGE_MATCH,
+        "done",
+        "Matching and timeline coverage complete",
+        Some(format!(
+            "best {:.3} · {:.1}% of song explained",
+            matches.first().map(|m| m.match_score).unwrap_or(0.0),
+            timeline.coverage_ratio * 100.0
+        )),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let verdict = compute_verdict_monolithic(
+        &matches,
+        &timeline,
+        config.verdict.pass_coverage_min,
+        config.verdict.require_strong_match,
+    );
 
     progress.emit(
         STAGE_METADATA,
+        "hash",
+        "Computing file hashes",
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let audio_for_hash = audio.to_path_buf();
+    let assets_for_hash = scan.audio_assets.clone();
+    let progress_meta = progress.clone();
+    let meta_done = Arc::new(AtomicUsize::new(0));
+    let meta_done_b = Arc::clone(&meta_done);
+    let progress_meta_b = progress_meta.clone();
+    let meta_total = asset_total + 2;
+    let scan_for_hash = scan.clone();
+
+    let (asset_hashes, file_hashes) = rayon::join(
+        move || -> Result<HashMap<String, String>> {
+            assets_for_hash
+                .par_iter()
+                .map(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy().to_string();
+                    let hash = sha256_file(p)?;
+                    let n = meta_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress_meta.tick(
+                        STAGE_METADATA,
+                        "hash_stem",
+                        "Stem hash computed",
+                        U_META,
+                        None,
+                        Some(n - 1),
+                        Some(meta_total),
+                        Some(name.clone()),
+                        None,
+                    );
+                    Ok((name, hash))
+                })
+                .collect()
+        },
+        move || -> Result<(String, String)> {
+            let target_hash = sha256_file(&audio_for_hash)?;
+            let n = meta_done_b.fetch_add(1, Ordering::Relaxed) + 1;
+            progress_meta_b.tick(
+                STAGE_METADATA,
+                "hash_release",
+                "Release hash computed",
+                U_META,
+                None,
+                Some(n - 1),
+                Some(meta_total),
+                None,
+                None,
+            );
+            Ok((target_hash, project_manifest_hash(&scan_for_hash)?))
+        },
+    );
+    let asset_hashes = asset_hashes?;
+    let (target_hash, manifest_hash) = file_hashes?;
+
+    progress.tick(
+        STAGE_METADATA,
         "evidence",
         "Collecting metadata evidence",
-        0.85,
+        U_META,
+        None,
         None,
         None,
         None,
         None,
     );
     let metadata_evidence = collect_metadata(&scan, audio, &asset_hashes)?;
-    progress.finish_step();
 
-    progress.begin_step(plan.report_units);
-    progress.emit(
+    progress.tick(
         STAGE_REPORT,
         "build",
         "Building verification report",
-        0.0,
+        U_REPORT,
+        None,
         None,
         None,
         None,
@@ -583,14 +509,6 @@ fn run_verify_inner(
         "threshold": timeline.threshold,
         "explained_windows": timeline.explained_windows,
         "total_windows": timeline.total_windows,
-        "competitive_win_rate": verdict.competitive_win_rate,
-        "exclusive_advantage": verdict.exclusive_advantage,
-        "discrimination_pass": verdict.discrimination_pass,
-        "rival_scores": verdict.rival_scores.iter().map(|r| serde_json::json!({
-            "project": r.project_name,
-            "win_rate": r.win_rate,
-            "exclusive_advantage": r.exclusive_advantage,
-        })).collect::<Vec<_>>(),
     });
 
     let payload = build_report_payload(
@@ -600,17 +518,18 @@ fn run_verify_inner(
         &verdict,
         timeline_payload,
         metadata_evidence,
-        sha256_file(audio)?,
-        project_manifest_hash(&scan)?,
+        target_hash,
+        manifest_hash,
         asset_hashes,
         &config,
     )?;
 
-    progress.emit_step(
+    progress.tick(
         STAGE_REPORT,
         "json",
         "Writing report.json",
-        0.55,
+        U_REPORT,
+        None,
         None,
         None,
         None,
@@ -618,26 +537,26 @@ fn run_verify_inner(
     );
     write_json_report(&payload, out)?;
 
-    progress.emit_step(
+    progress.tick(
         STAGE_REPORT,
         "html",
         "Writing report.html",
-        1.0,
+        U_REPORT,
+        None,
         None,
         None,
         None,
         None,
     );
     write_html_report(&payload, out)?;
-    progress.finish_step();
 
     progress.complete_all();
     progress.emit(
         STAGE_DONE,
         "complete",
         "Verification complete",
-        1.0,
         Some(verdict.verdict.clone()),
+        None,
         None,
         None,
         None,
