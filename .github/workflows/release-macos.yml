@@ -100,6 +100,7 @@ jobs:
 
           for tag in "${version_tag}" "${latest_tag}"; do
             oras push "${repo}:${tag}" \
+              --disable-path-validation \
               --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
               --annotation "org.opencontainers.image.description=Human Music macOS desktop verifier (${VERSION})" \
               "${staging}/Human-Music.dmg:application/x-apple-diskimage" \
