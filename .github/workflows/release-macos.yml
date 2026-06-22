@@ -1,0 +1,109 @@
+name: Release macOS app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  PACKAGE: human-music
+
+jobs:
+  build-and-publish:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/app/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: src/app
+        run: npm ci
+
+      - name: Build Tauri app
+        working-directory: src/app
+        run: npm run build
+        env:
+          CI: true
+
+      - name: Resolve version tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "label=${GITHUB_REF#refs/tags/}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "label=main-${GITHUB_SHA::7}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Locate build artifacts
+        id: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$(find . -path '*/bundle/dmg/*.dmg' | head -1)"
+          cli="$(find . -path '*/release/gb-verify' -type f | head -1)"
+          if [[ -z "${dmg}" ]]; then
+            echo "No .dmg found under bundle/dmg" >&2
+            find . -path '*/bundle/*' 2>/dev/null || true
+            exit 1
+          fi
+          if [[ -z "${cli}" ]]; then
+            echo "No gb-verify binary found" >&2
+            exit 1
+          fi
+          echo "dmg=${dmg}" >> "${GITHUB_OUTPUT}"
+          echo "cli=${cli}" >> "${GITHUB_OUTPUT}"
+          ls -lh "${dmg}" "${cli}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Publish macOS bundle to GHCR
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.label }}
+          DMG: ${{ steps.artifacts.outputs.dmg }}
+          CLI: ${{ steps.artifacts.outputs.cli }}
+        run: |
+          set -euo pipefail
+          repo="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${PACKAGE}"
+          version_tag="macos-${VERSION}"
+          latest_tag="macos-latest"
+
+          staging="$(mktemp -d)"
+          cp "${DMG}" "${staging}/Human-Music.dmg"
+          cp "${CLI}" "${staging}/gb-verify"
+          chmod +x "${staging}/gb-verify"
+
+          for tag in "${version_tag}" "${latest_tag}"; do
+            oras push "${repo}:${tag}" \
+              --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+              --annotation "org.opencontainers.image.description=Human Music macOS desktop verifier (${VERSION})" \
+              "${staging}/Human-Music.dmg:application/x-apple-diskimage" \
+              "${staging}/gb-verify:application/octet-stream"
+          done
+
+          echo "Published ${repo}:${version_tag} and ${repo}:${latest_tag}"
