@@ -41,6 +41,9 @@ jobs:
         env:
           CI: true
 
+      - name: Build gb-verify CLI
+        run: cargo build --release -p verification_engine --bin gb-verify
+
       - name: Resolve version tag
         id: version
         shell: bash
@@ -57,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           dmg="$(find . -path '*/bundle/dmg/*.dmg' | head -1)"
-          cli="$(find . -path '*/release/gb-verify' -type f | head -1)"
+          cli="$(find . -path '*/target/release/gb-verify' -type f | head -1)"
           if [[ -z "${dmg}" ]]; then
             echo "No .dmg found under bundle/dmg" >&2
             find . -path '*/bundle/*' 2>/dev/null || true
