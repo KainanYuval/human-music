@@ -88,7 +88,8 @@ jobs:
           CLI: ${{ steps.artifacts.outputs.cli }}
         run: |
           set -euo pipefail
-          repo="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${PACKAGE}"
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          repo="${REGISTRY}/${owner}/${PACKAGE}"
           version_tag="macos-${VERSION}"
           latest_tag="macos-latest"
 
